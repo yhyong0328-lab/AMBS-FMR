@@ -380,7 +380,8 @@ const FIREBASE_CONFIG = {
 
 // 같은 문서를 공유하려면 팀원 모두가 아래 값을 동일하게 유지해야 합니다.
 // 현재 보고 있는 연/월 (월별로 데이터가 분리 저장됩니다)
-let curYear = 2026, curMonth = 7;
+var _today = new Date();
+let curYear = _today.getFullYear(), curMonth = _today.getMonth() + 1;   // 열 때 항상 '현재 월'로 시작
 function roomId(){ return "ambs-" + curYear + "-" + String(curMonth).padStart(2, "0"); }
 function localKey(){ return "ambs_facility_local_" + roomId(); }
 /* ▲▲▲  여기까지만 수정하세요  ▲▲▲ */
@@ -432,6 +433,7 @@ const CLIENT_ID = Math.random().toString(36).slice(2);
 let dataRef = null, presenceRef = null;
 let firebaseReady = false;
 let applyingRemote = false;
+let roomLoaded = false;   // 이 달의 서버 데이터를 실제로 불러왔는가? false면 저장 금지 → 덮어쓰기 방지
 let saveTimer = null;
 
 function configFilled(){
@@ -450,6 +452,10 @@ function setSaved(){
   const prefix = firebaseReady ? "실시간 동기화됨 · " : "로컬 저장됨 · ";
   el.textContent = prefix + new Date().toLocaleTimeString('ko-KR');
   el.classList.remove('dirty');
+}
+function setLoading(){
+  const el = document.getElementById('saveState');
+  if(el){ el.textContent = "데이터 불러오는 중…"; el.classList.add('dirty'); }
 }
 let isConnected = false;
 let presenceCount = 1;
@@ -518,19 +524,26 @@ function initSync(){
 
 // 현재 월(roomId)의 데이터/프레즌스를 구독
 function subscribeRoom(){
+  roomLoaded = false;   // 새 달 구독 시작 — 서버 데이터를 받기 전엔 저장 금지
+  if(firebaseReady) setLoading();
   dataRef = db.ref('rooms/' + roomId() + '/data');
   presenceRef = db.ref('rooms/' + roomId() + '/presence');
   myPresenceRef = presenceRef.child(CLIENT_ID);
 
-  // 이 달이 비어 있으면 기본 데이터로 초기화
+  // 서버가 '진짜로' 비어 있다고 확인될 때만 기본 데이터로 최초 생성 (서버 응답이라 안전)
   dataRef.once('value').then(function(snap){
-    if(!snap.exists()){ dataRef.set(wrap(DATA)); }
-  });
+    if(!snap.exists()){
+      dataRef.set(wrap(DATA));
+      roomLoaded = true;   // 새로 만든 빈 달 — 편집/저장 허용
+    }
+  }).catch(function(){ /* 연결 문제 시 아무것도 하지 않음 (덮어쓰기 방지) */ });
 
   // 원격 변경 실시간 수신
   dataRef.on('value', function(snap){
     const val = snap.val();
     if(!val || !val.data) return;
+    roomLoaded = true;          // 서버 데이터 도착 — 이제부터 저장 허용
+    maybeBackup(val.data);      // 알찬 데이터면 날짜별로 자동 백업
     if(val.by === CLIENT_ID) return;
     applyRemote(val.data);
   });
@@ -561,6 +574,7 @@ function changeMonth(delta){
   curYear = y; curMonth = m;
 
   updateMonthLabels();
+  roomLoaded = false;   // 새 달 불러오기 전 — 저장 금지 (이전 달/빈 화면이 새 달을 덮어쓰지 못하게)
   // 화면을 즉시 빈(기본) 상태로 리셋 — 이전 달 내용이 잠깐 보이지 않게
   DATA = normalizeData(JSON.parse(JSON.stringify(DEFAULT_DATA)));
   renderAll();
@@ -595,8 +609,50 @@ function setLabel(id, text){ const el = document.getElementById(id); if(el) el.t
 
 function wrap(d){ return { data: d, by: CLIENT_ID, at: Date.now() }; }
 
+/* ---- 자동 백업 (이중 안전망) ----
+   서버에서 받은 '알찬' 데이터를 사진 없이 가볍게, 하루 1번씩 날짜별로 보관합니다.
+   rooms/<방>/_backup/<YYYY-MM-DD> 에 저장되어, 혹시 본문이 비워져도 복구 근거가 남습니다. */
+function hasContent(d){
+  if(!d) return false;
+  try{
+    var cl = toArray(d.checklist);
+    for(var i=0;i<cl.length;i++){
+      var items = toArray(cl[i].items);
+      for(var j=0;j<items.length;j++){ if(items[j].c) return true; }
+      if(cl[i].date || cl[i].note) return true;
+    }
+    if(toArray(d.s2).length) return true;
+    if(toArray(d.s3).length) return true;
+  }catch(e){}
+  return false;
+}
+function stripPhotos(d){
+  var c = JSON.parse(JSON.stringify(d || {}));
+  ['s1photos','s2photos','s3photos'].forEach(function(k){
+    if(Array.isArray(c[k])) c[k].forEach(function(p){ if(p && p.img) p.img = "(사진 생략)"; });
+  });
+  return c;
+}
+var _lastBackupKey = "";
+function maybeBackup(serverData){
+  if(!firebaseReady || !db) return;
+  if(!hasContent(serverData)) return;            // 빈 템플릿은 백업하지 않음
+  var day = new Date().toISOString().slice(0,10);
+  var key = roomId() + "/" + day;
+  if(key === _lastBackupKey) return;             // 같은 달·같은 날 중복 저장 방지
+  _lastBackupKey = key;
+  try{
+    db.ref('rooms/' + roomId() + '/_backup/' + day)
+      .set({ at: Date.now(), by: CLIENT_ID, data: stripPhotos(serverData) });
+  }catch(e){}
+}
+
 function pushData(){
   if(firebaseReady && dataRef){
+    if(!roomLoaded){
+      console.warn("아직 이 달 데이터를 불러오지 못해 저장을 건너뜁니다 (실제 데이터 덮어쓰기 방지).");
+      return;
+    }
     dataRef.set(wrap(DATA)).then(setSaved).catch(function(err){
       console.warn("저장 실패:", err);
     });
